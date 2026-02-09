@@ -59,6 +59,28 @@ Windows helper (PowerShell):
 powershell -NoProfile -ExecutionPolicy Bypass -File .\\download_youtube_sub.ps1
 ```
 
+## Download Video (Highest Resolution)
+
+This uses `yt-dlp` to download the highest available quality. For best quality it often needs `ffmpeg` to merge video+audio.
+
+Download:
+
+```powershell
+python .\\download_youtube_video.py
+```
+
+One-liner:
+
+```powershell
+python .\\download_youtube_video.py \"https://youtu.be/RVyjM5YBF9Q\" --out .\\videos
+```
+
+If you need a proxy (example):
+
+```powershell
+python .\\download_youtube_video.py \"https://youtu.be/RVyjM5YBF9Q\" --proxy http://127.0.0.1:7897
+```
+
 ## Notes
 
 - DownSub's `get-info.downsub.com` often returns transient `503/429`. The script retries with backoff.
