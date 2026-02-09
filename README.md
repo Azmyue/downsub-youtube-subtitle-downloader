@@ -28,6 +28,19 @@ python .\\get_youtube_subtitle.py
 
 If you don't pass `--lang`, an interactive list will be shown (use Up/Down, Enter to download).
 
+If you see `SSL: UNEXPECTED_EOF_WHILE_READING` on Windows, it's usually caused by a local/system proxy.
+By default the script bypasses system proxy settings. If you really need the system proxy, run with:
+
+```powershell
+python .\\get_youtube_subtitle.py --use-system-proxy
+```
+
+If downloading still fails due to SSL/network flakiness on Windows, you can enable a fallback that uses `curl.exe`:
+
+```powershell
+python .\\get_youtube_subtitle.py --curl-fallback
+```
+
 Download (one-liner):
 
 ```powershell

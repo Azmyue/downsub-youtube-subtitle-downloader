@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import random
@@ -114,18 +115,35 @@ def get_info_with_retry(enc_id: str, session: requests.Session, retries: int = 1
     url = f"https://get-info.downsub.com/{enc_id}"
     last = None
     for i in range(retries):
-        r = session.get(url, timeout=30)
-        last = r
         try:
-            data = r.json()
-        except Exception:
-            data = {"raw": r.text}
+            r = session.get(url, timeout=30)
+            last = r
+            try:
+                data = r.json()
+            except Exception:
+                data = {"raw": r.text}
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            # Often caused by flaky local proxy / MITM / upstream. Treat as transient.
+            if i == retries - 1:
+                raise
+            delay = min(8.0, 0.7 * (2**i)) + random.random() * 0.3
+            time.sleep(delay)
+            continue
 
         if r.status_code == 200 and isinstance(data, dict) and "subtitles" in data:
             return data
 
-        # Transient behaviors: 503 + {"error":"Video not found or unavailable"}.
-        if r.status_code in (429, 503) or (500 <= r.status_code <= 599):
+        # Transient behaviors:
+        # - 503 + {"error":"Video not found or unavailable"} is often temporary on the first request.
+        # - 429 / 5xx can happen due to rate limiting / upstream.
+        if r.status_code == 503 and isinstance(data, dict) and "error" in data:
+            msg = str(data.get("error") or "")
+            if "Video not found or unavailable" in msg:
+                # Fast retry helps more than long exponential delays.
+                time.sleep(1.0 + random.random() * 0.2)
+                continue
+
+        if r.status_code == 429 or (500 <= r.status_code <= 599):
             # Exponential backoff with jitter, capped.
             delay = min(8.0, 0.7 * (2**i)) + random.random() * 0.3
             time.sleep(delay)
@@ -158,6 +176,37 @@ def pick_subtitle(data: dict, lang: str | None) -> dict | None:
     if trans:
         return trans[0]
     return None
+
+
+def _download_with_requests(session: requests.Session, url: str, retries: int = 6) -> requests.Response:
+    last_exc = None
+    for i in range(retries):
+        try:
+            r = session.get(url, allow_redirects=True, timeout=60)
+            r.raise_for_status()
+            return r
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_exc = e
+            delay = min(8.0, 0.7 * (2**i)) + random.random() * 0.3
+            time.sleep(delay)
+    raise RuntimeError(f"download failed after retries due to network/SSL error: {last_exc}") from last_exc
+
+
+def _download_with_curl(url: str, out_path: str) -> None:
+    """
+    Fallback for Windows environments where Python SSL handshake is flaky.
+    Uses curl.exe to follow redirects and save the file.
+    """
+    curl = shutil.which("curl.exe") or shutil.which("curl")
+    if not curl:
+        raise RuntimeError("curl.exe not found for fallback download")
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    cmd = [curl, "-sS", "-L", "-o", out_path, url]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        stderr = (p.stderr or "").strip()
+        raise RuntimeError(f"curl download failed (code {p.returncode}): {stderr}")
 
 
 def _build_tracks(info: dict) -> list[dict]:
@@ -277,6 +326,17 @@ def main() -> int:
     ap.add_argument("--lang", default=None, help="Subtitle code/name, e.g. zh-CN / zh / English")
     ap.add_argument("--out", default="dl", help="Output directory (default: ./dl)")
     ap.add_argument("--list", action="store_true", help="Print available subtitles and exit")
+    ap.add_argument("--retries", type=int, default=12, help="Retry attempts for get-info/download (default: 12)")
+    ap.add_argument(
+        "--use-system-proxy",
+        action="store_true",
+        help="Use system proxy settings (Windows Internet Options). Default: disabled to avoid SSL EOF issues.",
+    )
+    ap.add_argument(
+        "--curl-fallback",
+        action="store_true",
+        help="If requests download fails due to SSL/network issues, fallback to curl.exe (Windows).",
+    )
     ap.add_argument(
         "--no-ui",
         action="store_true",
@@ -309,6 +369,10 @@ def main() -> int:
         return 2
 
     sess = requests.Session()
+    # Requests on Windows can pick up WinINET proxy even if env vars are empty.
+    # Many local proxies (or capture tools) can cause SSL EOF; default to bypassing them.
+    if not args.use_system_proxy:
+        sess.trust_env = False
     sess.headers.update(
         {
             "User-Agent": (
@@ -321,7 +385,7 @@ def main() -> int:
         }
     )
 
-    info = get_info_with_retry(enc_id, sess, retries=12)
+    info = get_info_with_retry(enc_id, sess, retries=max(1, int(args.retries)))
 
     if args.list:
         tracks = _build_tracks(info)
@@ -368,16 +432,45 @@ def main() -> int:
     download_url = f"{url_subtitle}?title={quote(title_safe)}&url={token}"
 
     # Follow 301/302 to download.subtitle.to and fetch the file content.
-    r = sess.get(download_url, allow_redirects=True, timeout=60)
-    r.raise_for_status()
+    try:
+        r = _download_with_requests(sess, download_url, retries=max(1, min(12, int(args.retries))))
+        content = r.content
+        content_type = r.headers.get("Content-Type", "")
+    except Exception as e:
+        if not args.curl_fallback:
+            raise
+        # Fallback path: use curl.exe and infer extension from URL (default .srt).
+        content = b""
+        content_type = ""
+        # Use .srt by default for curl fallback (DownSub returns .srt for most cases).
+        out_dir = os.path.abspath(args.out)
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"{title_safe}_{picked.get('code') or 'unknown'}.srt")
+        _download_with_curl(download_url, out_path)
+        size = os.path.getsize(out_path)
+        print(
+            json.dumps(
+                {
+                    "title": title,
+                    "picked": {"name": picked.get("name"), "code": picked.get("code")},
+                    "savedTo": out_path,
+                    "bytes": size,
+                    "via": download_url,
+                    "note": "downloaded via curl fallback",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
 
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
 
-    ext = guess_ext(r.headers.get("Content-Type", ""))
+    ext = guess_ext(content_type)
     out_path = os.path.join(out_dir, f"{title_safe}_{picked.get('code') or 'unknown'}{ext}")
     with open(out_path, "wb") as f:
-        f.write(r.content)
+        f.write(content)
 
     print(
         json.dumps(
@@ -385,7 +478,7 @@ def main() -> int:
                 "title": title,
                 "picked": {"name": picked.get("name"), "code": picked.get("code")},
                 "savedTo": out_path,
-                "bytes": len(r.content),
+                "bytes": len(content),
                 "via": download_url,
             },
             ensure_ascii=False,
