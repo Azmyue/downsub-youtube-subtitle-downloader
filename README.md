@@ -81,6 +81,20 @@ If you need a proxy (example):
 python .\\download_youtube_video.py \"https://youtu.be/RVyjM5YBF9Q\" --proxy http://127.0.0.1:7897
 ```
 
+## Download Video + Subtitles In Parallel
+
+Single input URL, video downloads in background while you pick subtitle track:
+
+```powershell
+python .\\download_youtube_parallel.py
+```
+
+One-liner:
+
+```powershell
+python .\\download_youtube_parallel.py \"https://youtu.be/RVyjM5YBF9Q\" --curl-fallback
+```
+
 ## Notes
 
 - DownSub's `get-info.downsub.com` often returns transient `503/429`. The script retries with backoff.
