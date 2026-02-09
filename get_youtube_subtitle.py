@@ -20,6 +20,7 @@ import re
 import sys
 import time
 import random
+import shutil
 from urllib.parse import quote
 
 import requests
@@ -159,12 +160,128 @@ def pick_subtitle(data: dict, lang: str | None) -> dict | None:
     return None
 
 
+def _build_tracks(info: dict) -> list[dict]:
+    tracks: list[dict] = []
+    for x in info.get("subtitles") or []:
+        if isinstance(x, dict) and x.get("url"):
+            tracks.append(
+                {
+                    "group": "original",
+                    "name": x.get("name") or "",
+                    "code": x.get("code") or "",
+                    "url": x.get("url"),
+                }
+            )
+    for x in info.get("subtitlesAutoTrans") or []:
+        if isinstance(x, dict) and x.get("url"):
+            tracks.append(
+                {
+                    "group": "auto",
+                    "name": x.get("name") or "",
+                    "code": x.get("code") or "",
+                    "url": x.get("url"),
+                }
+            )
+    return tracks
+
+
+def _interactive_pick_track(tracks: list[dict], title: str) -> dict | None:
+    """
+    Windows-friendly interactive picker (no external deps).
+
+    Controls:
+      Up/Down: move
+      Enter: select
+      q / Esc: quit
+    """
+    if not tracks:
+        return None
+
+    try:
+        import msvcrt  # type: ignore
+    except Exception:
+        return None
+
+    idx = 0
+    offset = 0
+
+    def term_height() -> int:
+        # Reserve a few lines for header/footer.
+        h = shutil.get_terminal_size((100, 30)).lines
+        return max(8, h)
+
+    def render() -> None:
+        nonlocal offset
+        h = term_height()
+        view_h = h - 6
+        if idx < offset:
+            offset = idx
+        if idx >= offset + view_h:
+            offset = idx - view_h + 1
+
+        os.system("cls")
+        print(f"Title: {title}")
+        print("Select a subtitle track (Up/Down, Enter to download, q/Esc to quit)")
+        print("-" * 80)
+
+        end = min(len(tracks), offset + view_h)
+        for i in range(offset, end):
+            t = tracks[i]
+            prefix = "> " if i == idx else "  "
+            tag = "[O]" if t.get("group") == "original" else "[A]"
+            name = t.get("name") or ""
+            code = t.get("code") or ""
+            line = f"{prefix}{tag} {name} ({code})"
+            print(line[:78])
+
+        print("-" * 80)
+        print(f"{idx+1}/{len(tracks)}  [O]=original  [A]=auto-translated")
+
+    render()
+    while True:
+        ch = msvcrt.getwch()
+        if ch in ("q", "Q", "\x1b"):
+            return None
+        if ch == "\r":
+            return tracks[idx]
+        if ch in ("\x00", "\xe0"):
+            key = msvcrt.getwch()
+            if key == "H":  # up
+                idx = (idx - 1) % len(tracks)
+                render()
+            elif key == "P":  # down
+                idx = (idx + 1) % len(tracks)
+                render()
+            elif key == "G":  # home
+                idx = 0
+                render()
+            elif key == "O":  # end
+                idx = len(tracks) - 1
+                render()
+
+
+def _configure_stdio_utf8() -> None:
+    # Avoid Windows cp936/gbk encode crashes when printing non-ASCII.
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def main() -> int:
+    _configure_stdio_utf8()
+
     ap = argparse.ArgumentParser()
     ap.add_argument("url", nargs="?", help="YouTube URL")
     ap.add_argument("--lang", default=None, help="Subtitle code/name, e.g. zh-CN / zh / English")
     ap.add_argument("--out", default="dl", help="Output directory (default: ./dl)")
     ap.add_argument("--list", action="store_true", help="Print available subtitles and exit")
+    ap.add_argument(
+        "--no-ui",
+        action="store_true",
+        help="Disable interactive selection UI (auto-pick first track if --lang not provided)",
+    )
     args = ap.parse_args()
 
     url = args.url
@@ -207,10 +324,32 @@ def main() -> int:
     info = get_info_with_retry(enc_id, sess, retries=12)
 
     if args.list:
-        print(json.dumps({"title": info.get("title"), "subtitles": info.get("subtitles"), "autoTransCount": len(info.get("subtitlesAutoTrans") or [])}, ensure_ascii=False, indent=2))
+        tracks = _build_tracks(info)
+        print(
+            json.dumps(
+                {
+                    "title": info.get("title"),
+                    "tracks": [{"group": t["group"], "name": t["name"], "code": t["code"]} for t in tracks],
+                    "count": len(tracks),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 0
 
-    picked = pick_subtitle(info, args.lang)
+    title = info.get("title") or "subtitle"
+
+    picked: dict | None = None
+    if args.lang:
+        picked = pick_subtitle(info, args.lang)
+    else:
+        tracks = _build_tracks(info)
+        if sys.stdin.isatty() and not args.no_ui:
+            picked = _interactive_pick_track(tracks, title)
+        else:
+            picked = tracks[0] if tracks else None
+
     if not picked:
         print("no subtitles found", file=sys.stderr)
         return 1
@@ -220,7 +359,6 @@ def main() -> int:
         print("missing urlSubtitle", file=sys.stderr)
         return 1
 
-    title = info.get("title") or "subtitle"
     title_safe = safe_filename(title)
     token = picked.get("url")
     if not token:
@@ -258,4 +396,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        # Allow piping to tools like `Select-Object -First N` without crashing.
+        pass

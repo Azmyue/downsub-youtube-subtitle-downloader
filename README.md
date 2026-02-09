@@ -26,6 +26,8 @@ Download (interactive prompt):
 python .\\get_youtube_subtitle.py
 ```
 
+If you don't pass `--lang`, an interactive list will be shown (use Up/Down, Enter to download).
+
 Download (one-liner):
 
 ```powershell
