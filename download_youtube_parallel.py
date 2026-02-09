@@ -31,6 +31,7 @@ import os
 import shutil
 import sys
 import threading
+import time
 from typing import Any
 
 
@@ -57,6 +58,8 @@ def _download_video_bg(url: str, out_dir: str, proxy: str | None, result: dict[s
             "format": "bv*+ba/b" if ffmpeg_ok else "best",
             "quiet": True,
             "no_warnings": True,
+            "noprogress": True,
+            "logger": _SilentLogger(),
         }
         if proxy:
             ydl_opts["proxy"] = proxy
@@ -73,6 +76,17 @@ def _download_video_bg(url: str, out_dir: str, proxy: str | None, result: dict[s
     except Exception as e:
         result["ok"] = False
         result["error"] = str(e)
+
+
+class _SilentLogger:
+    def debug(self, msg):
+        pass
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        pass
 
 
 def main() -> int:
@@ -104,6 +118,8 @@ def main() -> int:
     os.makedirs(sub_out, exist_ok=True)
     os.makedirs(video_out, exist_ok=True)
 
+    t0 = time.time()
+
     # Start video download in background.
     vid_result: dict[str, Any] = {}
     t = threading.Thread(
@@ -112,9 +128,11 @@ def main() -> int:
         daemon=True,
     )
     t.start()
+    print(f"[{time.time() - t0:6.2f}s] Video download started in background: {video_out}")
 
     # Subtitle flow (reuse repo implementation).
     import get_youtube_subtitle as sub
+    print(f"[{time.time() - t0:6.2f}s] Fetching subtitle list...")
 
     # Build a session similar to CLI behavior.
     sess = sub.requests.Session()
@@ -147,6 +165,7 @@ def main() -> int:
     enc_id = sub.encode_cryptojs_aes_json(video_id, sub.DEFAULT_KEY)
     info = sub.get_info_with_retry(enc_id, sess, retries=max(1, int(args.retries)))
     title = info.get("title") or "subtitle"
+    print(f"[{time.time() - t0:6.2f}s] Subtitle list ready: {title}")
 
     picked = None
     if args.lang:
@@ -176,6 +195,7 @@ def main() -> int:
     download_url = f"{url_subtitle}?title={sub.quote(title_safe)}&url={token}"
 
     # Download subtitle (with optional curl fallback).
+    print(f"[{time.time() - t0:6.2f}s] Downloading subtitle: {picked.get('name')} ({picked.get('code')})")
     sub_path = os.path.join(sub_out, f"{title_safe}_{picked.get('code') or 'unknown'}.srt")
     try:
         r = sub._download_with_requests(sess, download_url, retries=max(1, min(12, int(args.retries))))
@@ -195,7 +215,9 @@ def main() -> int:
         sub_note = "downloaded via curl fallback"
 
     # Wait video.
+    print(f"[{time.time() - t0:6.2f}s] Subtitle done. Waiting for video download...")
     t.join()
+    print(f"[{time.time() - t0:6.2f}s] Video download finished.")
 
     print(
         {
